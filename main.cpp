@@ -41,9 +41,10 @@
 #include <QStringDecoder>
 
 #define SETTINGS_VER 2
-#define AXIS_PEAK 32768
-#define MAX_AXIS_VALUE 85
-#define DEADZONE_DEFAULT 5.0
+#define AXIS_PEAK 32767
+#define MAX_AXIS_VALUE 85.0
+#define MAX_DIAGONAL_VALUE 69.0
+#define DEADZONE_DEFAULT 8.2
 
 #define QT_INPUT_PLUGIN_VERSION 0x020500
 #define INPUT_PLUGIN_API_VERSION 0x020101
@@ -555,75 +556,97 @@ EXPORT void CALL ControllerCommand(int Control, unsigned char *Command)
         }
 }
 
-int modifyAxisValue(int axis_value, int Control, int direction)
+static double applyScaledDeadzone(const double originalAxis, int Control)
 {
-    axis_value = ((abs(axis_value) - controller[Control].deadzone) * MAX_AXIS_VALUE) / controller[Control].range;
-    axis_value *= direction;
-    axis_value = (float)axis_value * controller[Control].sensitivity;
-    axis_value = std::max(-MAX_AXIS_VALUE, std::min(axis_value, MAX_AXIS_VALUE));
+    double absoluteAxis = std::abs(originalAxis);
 
-    return axis_value;
+    if (absoluteAxis <= controller[Control].deadzone)
+        absoluteAxis = 0;
+    else
+        absoluteAxis = controller[Control].sensitivity * MAX_AXIS_VALUE * (absoluteAxis - controller[Control].deadzone) / controller[Control].range / absoluteAxis;
+
+    return absoluteAxis;
 }
 
-void setAxis(int Control, int axis, BUTTONS *Keys, QString axis_dir, int direction)
+// Credit: MerryMage
+static void simulateControlStick(const double originalX, const double originalY, int Control, int& finalX, int& finalY)
 {
-    int axis_value;
+    const double maxRadiusOuterDeadzone = 2.0 / std::sqrt(2.0) * (MAX_DIAGONAL_VALUE / MAX_AXIS_VALUE * controller[Control].range + controller[Control].deadzone);
+    // scale to [-maxRadiusOuterDeadzone, maxRadiusOuterDeadzone]
+    double ax = originalX * maxRadiusOuterDeadzone;
+    double ay = originalY * maxRadiusOuterDeadzone;
+
+    // scale ax and ay only if their distance from origin is within or at radius maxRadiusOuterDeadzone
+    double originalLength = std::hypot(ax, ay);
+    if (originalLength <= maxRadiusOuterDeadzone)
+    {
+        ax *= applyScaledDeadzone(ax, Control);
+        ay *= applyScaledDeadzone(ay, Control);
+    }
+    // correct ax and ay to be at radius maxRadiusOuterDeadzone if their distance from origin exceeds it
+    double scaledLength = std::hypot(ax, ay);
+    if(scaledLength > maxRadiusOuterDeadzone)
+    {
+        scaledLength = maxRadiusOuterDeadzone / scaledLength;
+        ax *= scaledLength;
+        ay *= scaledLength;
+    }
+
+    // bound diagonals to an octagonal range [-MAX_DIAGONAL_VALUE, MAX_DIAGONAL_VALUE]
+    if (ax != 0.0 && ay != 0.0)
+    {
+        const double slope = ay / ax;
+        double edgex = std::copysign(MAX_AXIS_VALUE * std::min(controller[Control].sensitivity, 1.0) / (std::abs(slope) + (MAX_AXIS_VALUE - MAX_DIAGONAL_VALUE) / MAX_DIAGONAL_VALUE), ax);
+        const double edgey = std::copysign(std::min(std::abs(edgex * slope), MAX_AXIS_VALUE * std::min(controller[Control].sensitivity, 1.0) / (1.0 / std::abs(slope) + (MAX_AXIS_VALUE - MAX_DIAGONAL_VALUE) / MAX_DIAGONAL_VALUE)), ay);
+        edgex = edgey / slope;
+
+        const double scale = std::sqrt(edgex*edgex + edgey*edgey) / maxRadiusOuterDeadzone;
+        ax *= scale;
+        ay *= scale;
+    }
+
+    // clamp cardinals to MAX_AXIS_VALUE
+    if(std::abs(ax) > MAX_AXIS_VALUE * std::min(controller[Control].sensitivity, 1.0)) ax = std::copysign(MAX_AXIS_VALUE * std::min(controller[Control].sensitivity, 1.0), ax);
+    if(std::abs(ay) > MAX_AXIS_VALUE * std::min(controller[Control].sensitivity, 1.0)) ay = std::copysign(MAX_AXIS_VALUE * std::min(controller[Control].sensitivity, 1.0), ay);
+
+    // precision error reduces values of both ax and ay- increase values with epsilon before cast to int 
+    ax = std::copysign(std::abs(ax) + 1e-09, ax);
+    ay = std::copysign(std::abs(ay) + 1e-09, ay);
+
+    finalX = (int)ax;
+    finalY = (int)ay;
+}
+
+static double setAxis(int Control, QString axis_dir, int direction, double input)
+{
+    double axis_value = input;
     QStringList value = gameSettings->value(controller[Control].profile + "/" + axis_dir).toString().split(",");
 
     switch (value.at(1).toInt()) {
         case 0 /*Keyboard*/:
-            if (myKeyState[value.at(0).toInt()]) {
-                if (axis == 0)
-                    Keys->X_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-                else
-                    Keys->Y_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-            }
+            if (myKeyState[value.at(0).toInt()]) axis_value = (double)direction;
             break;
         case 1 /*Button*/:
-            if (SDL_GameControllerGetButton(controller[Control].gamepad, (SDL_GameControllerButton)value.at(0).toInt())) {
-                if (axis == 0)
-                    Keys->X_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-                else
-                    Keys->Y_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-            }
+            if (SDL_GameControllerGetButton(controller[Control].gamepad, (SDL_GameControllerButton)value.at(0).toInt())) axis_value = (double)direction;
             break;
         case 2 /*Axis*/:
             axis_value = SDL_GameControllerGetAxis(controller[Control].gamepad, (SDL_GameControllerAxis)value.at(0).toInt());
-            if (abs(axis_value) > controller[Control].deadzone && axis_value * value.at(2).toInt() > 0) {
-                axis_value = modifyAxisValue(axis_value, Control, direction);
-                if (axis == 0)
-                    Keys->X_AXIS = (int8_t)axis_value;
-                else
-                    Keys->Y_AXIS = (int8_t)axis_value;
-            }
+            if (axis_value < -32767.0) axis_value = -32767.0;
+            axis_value = axis_value * direction / AXIS_PEAK;
             break;
         case 3 /*Joystick Hat*/:
-            if (SDL_JoystickGetHat(controller[Control].joystick, value.at(0).toInt()) & value.at(2).toInt()) {
-                if (axis == 0)
-                    Keys->X_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-                else
-                    Keys->Y_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-            }
+            if (SDL_JoystickGetHat(controller[Control].joystick, value.at(0).toInt()) & value.at(2).toInt()) axis_value = (double)direction;
             break;
         case 4 /*Joystick Button*/:
-            if (SDL_JoystickGetButton(controller[Control].joystick, value.at(0).toInt())) {
-                if (axis == 0)
-                    Keys->X_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-                else
-                    Keys->Y_AXIS = (int8_t)(MAX_AXIS_VALUE * direction);
-            }
+            if (SDL_JoystickGetButton(controller[Control].joystick, value.at(0).toInt())) axis_value = (double)direction;
             break;
         case 5 /*Joystick Axis*/:
             axis_value = SDL_JoystickGetAxis(controller[Control].joystick, value.at(0).toInt());
-            if (abs(axis_value) > controller[Control].deadzone && axis_value * value.at(2).toInt() > 0) {
-                axis_value = modifyAxisValue(axis_value, Control, direction);
-                if (axis == 0)
-                    Keys->X_AXIS = (int8_t)axis_value;
-                else
-                    Keys->Y_AXIS = (int8_t)axis_value;
-            }
+            if (axis_value < -32767.0) axis_value = -32767.0;
+            axis_value = axis_value * direction / AXIS_PEAK;
             break;
     }
+    return axis_value;
 }
 
 void setKey(int Control, uint32_t key, BUTTONS *Keys, QString button)
@@ -740,10 +763,16 @@ EXPORT void CALL GetKeys( int Control, BUTTONS *Keys )
     setKey(Control, 0x1000/*R_TRIG*/, Keys, "R");
     setKey(Control, 0x2000/*L_TRIG*/, Keys, "L");
 
-    setAxis(Control, 0/*X_AXIS*/, Keys, "AxisLeft", -1);
-    setAxis(Control, 0/*X_AXIS*/, Keys, "AxisRight", 1);
-    setAxis(Control, 1/*Y_AXIS*/, Keys, "AxisUp", 1);
-    setAxis(Control, 1/*Y_AXIS*/, Keys, "AxisDown", -1);
+    double originalX = 0.0, originalY = 0.0;
+    originalX = setAxis(Control, "AxisLeft", -1, originalX);
+    originalX = setAxis(Control, "AxisRight", 1, originalX);
+    originalY = setAxis(Control, "AxisUp", 1, originalY);
+    originalY = setAxis(Control, "AxisDown", -1, originalY);
+
+    int simulatedX = 0, simulatedY = 0;
+    simulateControlStick(originalX, originalY, Control, simulatedX, simulatedY);
+    Keys->X_AXIS = simulatedX;
+    Keys->Y_AXIS = simulatedY;
 }
 
 static int setupVosk()
@@ -909,9 +938,9 @@ EXPORT void CALL InitiateControllers(CONTROL_INFO ControlInfo)
         if (!gameSettings->contains(controller[i].profile + "/Sensitivity"))
             gameSettings->setValue(controller[i].profile + "/Sensitivity", 100.0);
 
-        controller[i].deadzone = AXIS_PEAK * (gameSettings->value(controller[i].profile + "/Deadzone").toFloat() / 100.0);
-        controller[i].range = AXIS_PEAK - controller[i].deadzone;
-        controller[i].sensitivity = gameSettings->value(controller[i].profile + "/Sensitivity").toFloat() / 100.0;
+        controller[i].deadzone = MAX_AXIS_VALUE * (gameSettings->value(controller[i].profile + "/Deadzone").toDouble() / 100.0);
+        controller[i].range = MAX_AXIS_VALUE - controller[i].deadzone;
+        controller[i].sensitivity = gameSettings->value(controller[i].profile + "/Sensitivity").toDouble() / 100.0;
 
         setPak(i);
     }
