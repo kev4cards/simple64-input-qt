@@ -11,9 +11,9 @@ typedef struct
     SDL_Joystick *joystick;
     QString device_path;
     QString profile;
-    int deadzone;
-    int range;
-    float sensitivity;
+    double deadzone;
+    double range;
+    double sensitivity;
 } SController;
 
 extern "C"
